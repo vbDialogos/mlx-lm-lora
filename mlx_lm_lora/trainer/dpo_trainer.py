@@ -45,6 +45,26 @@ class DPOTrainingArgs(SFTTrainingArgs):
 
 def get_token_scores(model, x, mask, cache=None):
     inputs, targets = x[:, :-1], x[:, 1:]
+    col_mask = mask[:, :-1]
+    total = inputs.shape[1]
+    n_sel = int(col_mask.sum().item())
+    # Memory-lean fast path: if masked positions form a contiguous tail,
+    # run the trunk on the full sequence (context) but the vocab head only
+    # on masked positions — identical scores, ~6x smaller logits tensor.
+    if 0 < n_sel < total:
+        tail_block = col_mask[:, total - n_sel:]
+        if int(tail_block.sum().item()) == n_sel * col_mask.shape[0]:
+            hidden = model.model(inputs, cache=cache)
+            hidden = hidden[:, total - n_sel:, :]
+            if model.args.tie_word_embeddings:
+                logits = model.model.embed_tokens.as_linear(hidden).astype(mx.float32)
+            else:
+                logits = model.lm_head(hidden).astype(mx.float32)
+            sel_scores = -nn.losses.cross_entropy(
+                logits, targets[:, total - n_sel:]
+            )
+            pad = mx.zeros((x.shape[0], total - n_sel))
+            return mx.concatenate([pad, sel_scores], axis=1)
     logits = model(inputs, cache=cache).astype(mx.float32)
     return -nn.losses.cross_entropy(logits, targets) * mask[:, :-1]
 
@@ -157,8 +177,17 @@ def iterate_dpo_batches(dataset, batch_size, max_seq_length, train=False):
                     :rejected_length
                 ]
 
-                chosen_masks[j, :chosen_length] = 1.0
-                rejected_masks[j, :rejected_length] = 1.0
+                # Mask only response positions (prompt prefix cancels in the
+                # chosen-rejected gap anyway; response-only masks enable
+                # tail-sliced logits and match ORPO's masking convention).
+                chosen_prompt_length = min(
+                    batch[j].get("chosen_prompt_length", 0), chosen_length
+                )
+                rejected_prompt_length = min(
+                    batch[j].get("rejected_prompt_length", 0), rejected_length
+                )
+                chosen_masks[j, chosen_prompt_length:chosen_length] = 1.0
+                rejected_masks[j, rejected_prompt_length:rejected_length] = 1.0
 
             yield mx.array(chosen_arr), mx.array(rejected_arr), mx.array(
                 chosen_masks
@@ -340,7 +369,6 @@ def train_dpo(
 
     loss_value_and_grad = nn.value_and_grad(model, loss_wrapper)
 
-    @partial(mx.compile, inputs=state, outputs=state)
     def step(batch, prev_grad, do_update):
         chosen, rejected, chosen_masks, rejected_masks = batch
 
@@ -378,6 +406,10 @@ def train_dpo(
                     curr_model, chunk, chunk_mask, cache=curr_cache
                 )
                 score_sum += chunk_scores.sum(-1)
+                # Materialize each chunk's forward graph (and its cache
+                # writes) so it can be freed before the next chunk/sequence;
+                # otherwise all lazy graphs pile up until the caller's eval.
+                mx.eval(score_sum)
 
                 if end >= seq_length:
                     break
@@ -467,7 +499,7 @@ def train_dpo(
                     ).sum(-1)
                     return (local_sum * weights).sum()
 
-                grad = mx.grad(local_loss_fn)(model)
+                _, grad = nn.value_and_grad(model, local_loss_fn)(model)
                 if seq_grad_accum is None:
                     seq_grad_accum = grad
                 else:

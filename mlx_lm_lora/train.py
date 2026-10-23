@@ -751,7 +751,7 @@ def train_model(
                 loss_type=args.dpo_cpo_loss_type,
                 delta=args.delta,
                 reference_model_path=args.reference_model_path,
-                seq_step_size=512 if args.efficient_long_context else None,
+                seq_step_size=16384 if args.efficient_long_context else None,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 qat_enable=args.qat_enable,
                 qat_bits=args.qat_bits,
